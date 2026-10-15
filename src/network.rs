@@ -12,7 +12,7 @@ use std::{
     thread::{self, sleep},
     time::Duration,
 };
-use ureq::{http::Response, Agent};
+use ureq::{config::IpFamily, http::Response, Agent};
 
 const MANIFEST_URL: &str = "https://releases.aosc.io/manifest/recipe.json";
 
@@ -43,9 +43,53 @@ static GIT_PROGRESS: LazyLock<indicatif::ProgressStyle> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Read a duration in seconds from the environment, falling back to `default`.
+///
+/// Network timeouts on mobile links vary wildly with signal quality, so every
+/// bound is overridable without recompiling.
+fn timeout_from_env(key: &str, default: u64) -> Duration {
+    let secs = std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default);
+    Duration::from_secs(secs)
+}
+
+/// Build an HTTP agent with explicit timeouts.
+///
+/// ureq 3.x defaults every timeout to `None`, meaning a stalled DNS lookup,
+/// TCP connect or TLS handshake hangs forever without any error. That is fine
+/// on glibc systems where the resolver falls back quickly, but on bionic
+/// (Termux/Android) an unreachable IPv6 address returned by netd is silently
+/// dropped and the request never completes. Bounding the connection phases
+/// turns such a stall into a regular `Err` so callers can report or retry.
+///
+/// Note that `timeout_recv_body` and `timeout_global` are deliberately left
+/// unset: the buildkit rootfs is ~1GB and a 0.3MB/s mobile link needs tens of
+/// minutes, so any body or global cap would abort a perfectly healthy
+/// download. Only the pre-body phases are bounded.
+///
+/// Environment overrides: `CIEL_TIMEOUT_RESOLVE`, `CIEL_TIMEOUT_CONNECT`,
+/// `CIEL_TIMEOUT_RECV_RESPONSE` (seconds).
+fn http_agent() -> Agent {
+    let mut builder = Agent::config_builder()
+        .timeout_resolve(Some(timeout_from_env("CIEL_TIMEOUT_RESOLVE", 10)))
+        .timeout_connect(Some(timeout_from_env("CIEL_TIMEOUT_CONNECT", 15)))
+        .timeout_recv_response(Some(timeout_from_env(
+            "CIEL_TIMEOUT_RECV_RESPONSE",
+            60,
+        )));
+    // Escape hatch for networks where IPv6 is advertised but not routable.
+    // Kept opt-in via env var so the default behaviour stays unchanged.
+    if std::env::var_os("CIEL_IPV4").is_some() {
+        builder = builder.ip_family(IpFamily::Ipv4Only);
+    }
+    builder.build().into()
+}
+
 /// Download a file from the web
 pub fn download_file(url: &str) -> Result<Response<ureq::Body>> {
-    Ok(Agent::new_with_defaults().get(url).call()?)
+    Ok(http_agent().get(url).call()?)
 }
 
 /// Download a file with progress indicator
@@ -78,7 +122,7 @@ pub fn download_file_progress(url: &str, file: &str) -> Result<u64> {
 
 /// Pick the latest buildkit rootfs according to the recipe
 pub fn pick_latest_rootfs(arch: &str) -> Result<RootFs> {
-    let mut resp = Agent::new_with_defaults().get(MANIFEST_URL).call()?;
+    let mut resp = http_agent().get(MANIFEST_URL).call()?;
     let recipe: Recipe = resp.body_mut().read_json()?;
     if recipe.version != 1 {
         return Err(anyhow!(

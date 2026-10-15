@@ -1,5 +1,6 @@
 //! This module contains systemd machined related APIs
 
+use crate::backend::CielInstance;
 use crate::common::{is_legacy_workspace, CIEL_INST_DIR};
 use crate::dbus_machine1::ManagerProxyBlocking;
 use crate::dbus_machine1_machine::MachineProxyBlocking;
@@ -25,18 +26,6 @@ const DEFAULT_NSPAWN_OPTIONS: &[&str] = &[
     "--capability=CAP_IPC_LOCK",
     "--system-call-filter=swapcontext",
 ];
-
-/// Instance status information
-#[derive(Debug)]
-pub struct CielInstance {
-    name: String,
-    // namespace name (in the form of `$name-$id`)
-    pub ns_name: String,
-    pub mounted: bool,
-    running: bool,
-    pub started: bool,
-    booted: Option<bool>,
-}
 
 /// Used for getting the instance name from Ciel 1/2
 fn legacy_container_name(path: &Path) -> Result<String> {

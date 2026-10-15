@@ -1,3 +1,4 @@
+pub use crate::backend::LayerManager;
 use crate::common;
 use anyhow::{anyhow, bail, Context, Result};
 use libmount::{mountinfo::Parser, Overlay};
@@ -11,35 +12,6 @@ use std::{
     ffi::OsStr,
     io::{BufRead, BufReader},
 };
-
-pub trait LayerManager {
-    /// Create a new layer manager from the given distribution directory
-    /// dist: distribution directory, inst: instance name (not directory)
-    fn from_inst_dir<P: AsRef<Path>>(
-        dist_path: P,
-        inst_path: P,
-        inst_name: P,
-    ) -> Result<Box<dyn LayerManager>>
-    where
-        Self: Sized;
-    /// Mount the filesystem to the given path
-    fn mount(&mut self, to: &Path) -> Result<()>;
-    /// Return if the filesystem is mounted
-    fn is_mounted(&self, target: &Path) -> Result<bool>;
-    /// Rollback the filesystem to the distribution state
-    fn rollback(&mut self) -> Result<()>;
-    /// Commit the current state of the instance filesystem to the distribution state
-    fn commit(&mut self) -> Result<()>;
-    /// Un-mount the filesystem
-    fn unmount(&mut self, target: &Path) -> Result<()>;
-    /// Return the directory where the configuration layer is located
-    /// You may temporary mount this directory if your backend does not expose this directory directly
-    fn get_config_layer(&mut self) -> Result<PathBuf>;
-    /// Set the volatile state of the instance filesystem
-    fn set_volatile(&mut self, volatile: bool) -> Result<()>;
-    /// Destroy the filesystem of the current instance
-    fn destroy(&mut self) -> Result<()>;
-}
 
 struct OverlayFS {
     inst: PathBuf,
@@ -171,6 +143,7 @@ impl LayerManager for OverlayFS {
         }))
     }
     fn mount(&mut self, to: &Path) -> Result<()> {
+        fs::create_dir_all(to)?;
         let base_dirs = [self.lower.clone(), self.base.clone()];
         let mut overlay = Overlay::writable(
             // base_dirs variable contains the base and lower directories

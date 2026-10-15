@@ -38,6 +38,9 @@ pub struct CielConfig {
     pub force_use_apt: bool,
     #[serde(default)]
     pub foreign_arch: Option<String>,
+    /// Container backend override: "nspawn" or "proot"
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl CielConfig {
@@ -66,9 +69,10 @@ impl Default for CielConfig {
             extra_options: Vec::new(),
             sep_mount: true,
             volatile_mount: false,
-            force_use_apt: false,
-            foreign_arch: None,
-        }
+        force_use_apt: false,
+        foreign_arch: None,
+        backend: None,
+    }
     }
 }
 
@@ -132,8 +136,14 @@ fn create_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The editor `ciel config` would use for its optional sources.list prompt.
+///
+/// `pub(crate)` so `ciel doctor` can check the *resolved* program rather than
+/// re-implementing the VISUAL -> EDITOR -> editor -> nano chain and drifting
+/// from it: upstream's version of that check looked only at `EDITOR` and
+/// `editor`, so it failed on hosts that would in fact have worked.
 #[inline]
-fn get_default_editor() -> OsString {
+pub(crate) fn get_default_editor() -> OsString {
     if let Some(prog) = std::env::var_os("VISUAL") {
         return prog;
     }

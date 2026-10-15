@@ -9,7 +9,7 @@ use crate::{
     common::*,
     config, error, info,
     network::{download_git, pick_latest_rootfs},
-    overlayfs::create_new_instance_fs,
+    backend::create_instance,
     repo::{init_repo, refresh_repo},
     warn,
 };
@@ -111,7 +111,7 @@ pub fn onboarding(custom_tarball: Option<&String>, arch: Option<&str>) -> Result
     }
 
     if let Some(init_instance) = init_instance {
-        create_new_instance_fs(CIEL_INST_DIR, &init_instance)?;
+        create_instance(&init_instance)?;
         info!("{}: instance initialized.", init_instance);
         if config.local_repo {
             mount_fs(&init_instance)?;

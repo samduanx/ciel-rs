@@ -13,3 +13,6 @@
 *.squashfs
 .vscode
 .idea
+
+# WorkBuddy agent working data (memory, session state)
+.workbuddy/

@@ -1,15 +1,24 @@
 mod actions;
+mod backend;
 mod cli;
 mod common;
 mod config;
+#[cfg(feature = "nspawn")]
 mod dbus_machine1;
+#[cfg(feature = "nspawn")]
 mod dbus_machine1_machine;
 mod diagnose;
+mod dircopy;
+mod guestpatch;
 mod logging;
+#[cfg(feature = "nspawn")]
+#[allow(dead_code)]
 mod machine;
 mod network;
+#[cfg(feature = "nspawn")]
 mod overlayfs;
 mod repo;
+mod squashfs;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::ArgMatches;
@@ -110,7 +119,7 @@ fn main() -> Result<()> {
     let build_cli = cli::build_cli();
     let version_string = build_cli.render_version();
     let args = build_cli.get_matches();
-    if !is_root() {
+    if !is_root() && !allow_unprivileged() {
         println!("Please run me as root!");
         process::exit(1);
     }
@@ -141,7 +150,7 @@ fn main() -> Result<()> {
     }
     // list instances if no command is specified
     if subcmd.is_none() {
-        machine::print_instances()?;
+        backend::print_instances()?;
         return Ok(());
     }
     let subcmd = subcmd.unwrap();
@@ -368,10 +377,10 @@ fn main() -> Result<()> {
             process::exit(status);
         }
         ("", _) => {
-            machine::print_instances()?;
+            backend::print_instances()?;
         }
         ("list", _) => {
-            machine::print_instances()?;
+            backend::print_instances()?;
         }
         ("doctor", _) => {
             print_error!({ diagnose::run_diagnose() });

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use console::user_attended;
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use digest_io::IoWrapper;
@@ -14,7 +14,10 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use unsquashfs_wrapper::Unsquashfs;
+use console::style;
+use crate::info;
+use crate::squashfs;
+use crate::warn;
 
 pub const CIEL_MAINLINE_ARCHS: &[&str] = &[
     "amd64",
@@ -60,7 +63,7 @@ macro_rules! make_progress_bar {
         concat!(
             "{spinner} [{bar:25.cyan/blue}] ",
             $msg,
-            " ({bytes_per_sec}, eta {eta})"
+            " ({bytes_per_sec}, eta {eta}){msg}"
         )
     };
 }
@@ -152,6 +155,23 @@ pub fn is_in_ci() -> bool {
     }
 }
 
+/// Termux/Android (and similar unprivileged environments) can never have real
+/// root; the proot backend fakes root inside the container instead.
+pub fn allow_unprivileged() -> bool {
+    std::env::var_os("CIEL_ALLOW_UNPRIVILEGED").is_some()
+        || std::env::var_os("TERMUX_VERSION").is_some()
+}
+
+/// Whether we are running inside a systemd-nspawn container, where creating
+/// `/dev/console` fails because `/dev` is not fully populated.
+pub fn in_systemd_nspawn() -> bool {
+    std::process::Command::new("systemd-detect-virt")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|virt| virt.trim() == "systemd-nspawn")
+}
+
 /// Extract the given .tar.xz stream and preserve all the file attributes
 pub fn extract_tar_xz<R: Read>(reader: R, path: &Path) -> Result<()> {
     let decompress = xz2::read::XzDecoder::new(reader);
@@ -165,13 +185,14 @@ pub fn extract_tar_xz<R: Read>(reader: R, path: &Path) -> Result<()> {
 
 /// Extract the given .squashfs
 pub fn extract_squashfs(path: &Path, dist_dir: &Path, pb: &ProgressBar, total: u64) -> Result<()> {
-    let unsquashfs = Unsquashfs::default();
+    // Resolve the extractor up front. A missing binary is a hard, actionable
+    // error — it must never be downgraded to a warning, otherwise `ciel new`
+    // happily continues with an empty dist/ and only fails much later with a
+    // confusing "no such file or directory".
+    let extractor = squashfs::Extractor::resolve()?;
+    info!("Using SquashFS extractor: {}", extractor.describe());
 
-    unsquashfs.extract(path, dist_dir, None, move |c| {
-        pb.set_position(total * c as u64 / 100);
-    })?;
-
-    Ok(())
+    squashfs::extract(extractor, path, dist_dir, pb, total)
 }
 
 pub fn extract_system_rootfs(path: &Path, total: u64, use_tarball: bool) -> Result<()> {
@@ -189,32 +210,48 @@ pub fn extract_system_rootfs(path: &Path, total: u64, use_tarball: bool) -> Resu
     let dist_dir = PathBuf::from(CIEL_DIST_DIR);
     if dist_dir.exists() {
         fs::remove_dir_all(&dist_dir).ok();
-        fs::create_dir_all(&dist_dir)?;
     }
+    // Always (re)create the destination. Previously this only ran when the
+    // directory already existed, so a first run without a pre-existing dist/
+    // handed the tools a missing path and failed in a confusing way.
+    fs::create_dir_all(&dist_dir)?;
 
-    // detect if we are running in systemd-nspawn
-    // where /dev/console character device file cannot be created
-    // thus ignoring the error in extracting
-    let mut in_systemd_nspawn = false;
-    if let Ok(output) = std::process::Command::new("systemd-detect-virt").output() {
-        if let Ok("systemd-nspawn") = std::str::from_utf8(&output.stdout) {
-            in_systemd_nspawn = true;
+    // Whether per-file extraction failures may be tolerated.
+    //
+    // Inside systemd-nspawn /dev/console cannot be created, and on Termux no
+    // device node can be created at all, so `tar` will report errors for those
+    // entries while still unpacking everything else. Those are expected and
+    // only affect nodes that the container backend shadows at runtime.
+    //
+    // This flag must stay scoped to the tarball path. A squashfs failure means
+    // the *extractor itself* failed (missing binary, unknown compressor,
+    // aborted mid-image) — none of which is a per-node cosmetic issue, and all
+    // of which used to be swallowed here, leaving an empty dist/ behind.
+    let tolerate_node_errors = allow_unprivileged() || in_systemd_nspawn();
+
+    if use_tarball {
+        if let Err(e) = extract_tar_xz(progress_bar.wrap_read(f), &dist_dir) {
+            if !tolerate_node_errors {
+                return Err(e).context("Failed to extract rootfs tarball");
+            }
+            warn!(
+                "Rootfs extraction reported errors, ignored on container/unprivileged \
+                 environments: {e:#}"
+            );
         }
-    }
-
-    let res = if use_tarball {
-        extract_tar_xz(progress_bar.wrap_read(f), &dist_dir)
     } else {
-        extract_squashfs(path, &dist_dir, &progress_bar, total)
-    };
-
-    if !in_systemd_nspawn {
-        res?
+        // Any error here is fatal. See the comment above.
+        extract_squashfs(path, &dist_dir, &progress_bar, total)?;
     }
 
     progress_bar.finish_and_clear();
 
-    Ok(())
+    // The extractor may have reported success yet produced an unusable tree
+    // (aborted mid-image, skipped everything). Verify before letting anything
+    // downstream touch dist/, so the failure surfaces here rather than as a
+    // baffling ENOENT from `ciel shell` much later.
+    squashfs::verify_extracted_rootfs(&dist_dir)
+        .with_context(|| format!("Rootfs extraction into {CIEL_DIST_DIR} did not complete"))
 }
 
 pub fn ciel_init() -> Result<()> {
@@ -229,21 +266,28 @@ pub fn ciel_init() -> Result<()> {
 
 /// Find the ciel directory
 pub fn find_ciel_dir<P: AsRef<Path>>(start: P) -> Result<PathBuf> {
-    let start_path = fs::metadata(start.as_ref())?;
-    let start_dev = start_path.dev();
+    let start_dev = fs::metadata(start.as_ref()).ok().map(|m| m.dev());
     let mut current_dir = start.as_ref().to_path_buf();
+    let mut warned = false;
     loop {
-        if !current_dir.exists() {
-            return Err(anyhow!("Hit filesystem ceiling!"));
-        }
-        let current_dev = current_dir.metadata()?.dev();
-        if current_dev != start_dev {
-            return Err(anyhow!("Hit filesystem boundary!"));
-        }
         if current_dir.join(".ciel").is_dir() {
             return Ok(current_dir);
         }
-        current_dir = current_dir.join("..");
+        let current_canon = current_dir.canonicalize()?;
+        let next = current_dir.join("..");
+        let next_canon = next.canonicalize()?;
+        if next_canon == current_canon {
+            return Err(anyhow!("Hit filesystem ceiling!"));
+        }
+        // Downgraded to a warning: on Android the search may legitimately
+        // cross mountpoints (e.g. /data sub-mounts).
+        if let (Some(start_dev), Ok(next_dev)) = (start_dev, next_canon.metadata().map(|m| m.dev())) {
+            if start_dev != next_dev && !warned {
+                warn!("Crossed a filesystem boundary while looking for the ciel workspace");
+                warned = true;
+            }
+        }
+        current_dir = next;
     }
 }
 

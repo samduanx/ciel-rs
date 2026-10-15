@@ -1,7 +1,7 @@
 use anyhow::Result;
 use console::style;
 
-use crate::machine;
+use crate::backend;
 
 mod container;
 mod onboarding;
@@ -59,7 +59,7 @@ pub fn ensure_host_sanity() -> Result<MountOptions, std::io::Error> {
 /// A convenience function for iterating over all the instances while executing the actions
 #[inline]
 pub fn for_each_instance<F: Fn(&str) -> Result<()>>(func: &F) -> Result<()> {
-    let instances = machine::list_instances_simple()?;
+    let instances = backend::list_instances_simple()?;
     for instance in instances {
         eprintln!("{} {}", style(">>>").bold(), style(&instance).cyan().bold());
         func(&instance)?;

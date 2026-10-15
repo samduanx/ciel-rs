@@ -8,9 +8,16 @@ repository = "https://github.com/AOSC-Dev/ciel-rs"
 resolver = "2"
 edition = "2021"
 
+[features]
+default = ["nspawn"]
+# nspawn: upstream systemd-nspawn backend (systemd, D-Bus, machined)
+nspawn = ["dep:zbus", "dep:libsystemd-sys", "dep:libmount", "dep:xattr"]
+# proot: portable backend for Termux/Android (no mount(2), no systemd, no D-Bus)
+proot = []
+
 [dependencies]
 console = "0.16"
-zbus = "^5"
+zbus = { version = "^5", optional = true }
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 indicatif = "0.18"
 nix = { version = "0.31", features = ["fs", "hostname", "mount", "user"] }
@@ -20,15 +27,15 @@ serde = { version = "1.0", features = ["derive"] }
 git2 = "0.21"
 tar = "0.4"
 xz2 = "0.1"
-libmount = { git = "https://github.com/liushuyu/libmount", rev = "6fe8dba03a6404dfe1013995dd17af1c4e21c97b" }
+libmount = { git = "https://github.com/liushuyu/libmount", rev = "6fe8dba03a6404dfe1013995dd17af1c4e21c97b", optional = true }
 libc = "0.2"
 adler32 = "1.2"
 rayon = "1.12"
 tempfile = "3.27"
 anyhow = "1.0"
-libsystemd-sys = "0.9"
+libsystemd-sys = { version = "0.9", optional = true }
 walkdir = "2"
-xattr = "^1"
+xattr = { version = "^1", optional = true }
 rand = "0.10"
 dotenvy = "0.15"
 which = "8.0"
@@ -43,7 +50,6 @@ ar = "0.9"
 faster-hex = "0.10"
 flate2 = "1.1"
 tabwriter = { version = "^1", features = ["ansi_formatting"] }
-unsquashfs-wrapper =  "0.3"
 inotify = "0.11"
 zstd = "0.13"
 ureq = { version = "^3", features = ["json"] }

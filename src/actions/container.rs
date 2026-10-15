@@ -12,13 +12,15 @@ use std::{
 
 use crate::{
     actions::{ensure_host_sanity, OMA_UPDATE_SCRIPT},
+    backend::{
+        clean_child_process, create_instance, detect_backend_kind, execute_container_command,
+        get_container_ns_name, get_layer_manager, inspect_instance, mount_layers, spawn_container,
+        terminate_container_by_name, BackendKind,
+    },
     common::*,
     config, error, info,
-    machine::{
-        self, get_container_ns_name, inspect_instance, spawn_container, terminate_container_by_name,
-    },
     network::download_file_progress,
-    overlayfs, repo, warn,
+    repo, warn,
 };
 
 use super::{for_each_instance, APT_UPDATE_SCRIPT};
@@ -55,7 +57,7 @@ fn commit(instance: &str) -> Result<()> {
     for_each_instance(&container_down)?;
     info!("{}: committing instance...", instance);
     let spinner = create_spinner("Committing upper layer...", 200);
-    let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+    let man = &mut *get_layer_manager(instance)?;
     man.commit()?;
     sync();
     spinner.finish_and_clear();
@@ -68,7 +70,7 @@ fn rollback(instance: &str) -> Result<()> {
     get_instance_ns_name(instance)?;
     info!("{}: rolling back instance...", instance);
     let spinner = create_spinner("Removing upper layer...", 200);
-    let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+    let man = &mut *get_layer_manager(instance)?;
     man.rollback()?;
     sync();
     spinner.finish_and_clear();
@@ -169,7 +171,7 @@ pub fn config_os(instance: Option<&str>) -> Result<()> {
     }
     let path;
     if let Some(instance) = instance {
-        let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+        let man = &mut *get_layer_manager(instance)?;
         path = man.get_config_layer()?;
     } else {
         path = PathBuf::from(CIEL_DIST_DIR);
@@ -211,9 +213,9 @@ pub fn config_os(instance: Option<&str>) -> Result<()> {
 /// Mount the filesystem of the instance
 pub fn mount_fs(instance: &str) -> Result<()> {
     let config = config::read_config()?;
-    let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+    let man = &mut *get_layer_manager(instance)?;
     man.set_volatile(config.volatile_mount)?;
-    machine::mount_layers(man, instance)?;
+    mount_layers(man, instance)?;
     info!("{}: filesystem mounted.", instance);
 
     Ok(())
@@ -221,7 +223,7 @@ pub fn mount_fs(instance: &str) -> Result<()> {
 
 /// Un-mount the filesystem of the container
 pub fn unmount_fs(instance: &str) -> Result<()> {
-    let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+    let man = &mut *get_layer_manager(instance)?;
     let target = std::env::current_dir()?.join(instance);
     let mut retry = 0usize;
     while man.is_mounted(&target)? {
@@ -282,20 +284,27 @@ fn get_instance_ns_name(instance: &str) -> Result<String> {
 /// Start the container/instance, also mounting the container filesystem prior to the action
 pub fn start_container(instance: &str, read_write_permitted: bool) -> Result<String> {
     let ns_name = get_instance_ns_name(instance)?;
-    let inst = inspect_instance(instance, &ns_name)?;
+    let inst = inspect_instance(instance)?;
     let (mut extra_options, mounts) = ensure_host_sanity()?;
     if std::env::var("CIEL_OFFLINE").is_ok() {
-        // FIXME: does not work with current version of systemd
-        // add the offline option (private-network means don't share the host network)
-        extra_options.push("--private-network".to_string());
-        info!("{}: network disconnected.", instance);
+        if detect_backend_kind() == BackendKind::Proot {
+            warn!(
+                "{}: the proot backend cannot isolate the network, CIEL_OFFLINE is ignored.",
+                instance
+            );
+        } else {
+            // FIXME: does not work with current version of systemd
+            // add the offline option (private-network means don't share the host network)
+            extra_options.push("--private-network".to_string());
+            info!("{}: network disconnected.", instance);
+        }
     }
     if !inst.mounted {
         mount_fs(instance)?;
     }
     if inst.started {
         // restart the container to apply the new options
-        terminate_container_by_name(&ns_name)?;
+        terminate_container_by_name(instance)?;
 
         // FIXME: Mission-driven hack, was RISC-V so slow such that it
         // triggered a race condition? Or does systemd-nspawn/cgroup not
@@ -326,8 +335,8 @@ pub fn prepare_local_repo(instance: &str) -> Result<()> {
     }
     let conf = conf.unwrap();
     if conf.local_repo {
-        let ns_name = get_instance_ns_name(instance)?;
-        let inst = inspect_instance(instance, &ns_name)?;
+        get_instance_ns_name(instance)?;
+        let inst = inspect_instance(instance)?;
         let output_dir = get_output_directory(conf.sep_mount);
         let root = std::env::current_dir()?.join(output_dir);
         if !inst.mounted {
@@ -345,23 +354,23 @@ pub fn run_in_container<S: AsRef<OsStr>>(
     args: &[S],
     read_write_permitted: bool,
 ) -> Result<i32> {
-    let ns_name = start_container(instance, read_write_permitted)?;
-    let status = machine::execute_container_command(&ns_name, args)?;
+    start_container(instance, read_write_permitted)?;
+    let status = execute_container_command(instance, args)?;
 
     Ok(status)
 }
 
 /// Stop the container/instance (without un-mounting the filesystem)
 pub fn stop_container(instance: &str) -> Result<()> {
-    let ns_name = get_instance_ns_name(instance)?;
-    let inst = inspect_instance(instance, &ns_name)?;
+    get_instance_ns_name(instance)?;
+    let inst = inspect_instance(instance)?;
     if !inst.started {
         info!("{}: instance is not running!", instance);
         return Ok(());
     }
     info!("{}: stopping...", instance);
-    machine::terminate_container_by_name(&ns_name)?;
-    machine::clean_child_process();
+    terminate_container_by_name(instance)?;
+    clean_child_process();
     info!("{}: instance stopped.", instance);
 
     Ok(())
@@ -397,7 +406,7 @@ pub fn rollback_container(instance: &str) -> Result<()> {
 /// Create a new instance
 #[inline]
 pub fn add_instance(instance: &str) -> Result<()> {
-    overlayfs::create_new_instance_fs(CIEL_INST_DIR, instance)?;
+    create_instance(instance)?;
     info!("{}: instance created.", instance);
 
     Ok(())
@@ -408,7 +417,7 @@ pub fn remove_instance(instance: &str) -> Result<()> {
     container_down(instance)?;
     info!("{}: removing instance...", instance);
     let spinner = create_spinner("Removing the instance...", 200);
-    let man = &mut *overlayfs::get_overlayfs_manager(instance)?;
+    let man = &mut *get_layer_manager(instance)?;
     man.destroy()?;
     spinner.finish_and_clear();
     info!("{}: instance removed.", instance);
@@ -417,6 +426,12 @@ pub fn remove_instance(instance: &str) -> Result<()> {
 }
 
 /// Update AOSC OS in the container/instance
+///
+/// The flow is backend-agnostic: create a temporary instance, run the update
+/// scripts inside it, then `commit_container()` promotes the instance root to
+/// the base layer. On the proot backend `commit` is the dircopy rename
+/// hand-over (see `DirCopyManager::commit`), on nspawn it is the overlayfs
+/// upper-layer merge.
 pub fn update_os(force_use_apt: bool) -> Result<()> {
     info!("Updating base OS...");
     let instance = format!("update-{:x}", random::<u32>());
